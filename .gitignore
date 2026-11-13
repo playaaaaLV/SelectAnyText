@@ -1,0 +1,5 @@
+/build/
+/dist/
+/SelectAnyText-*.zip
+/.vs/
+/installer/vcpkg_installed/

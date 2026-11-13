@@ -1,0 +1,8 @@
+{
+  "name": "selectanytext-ocr",
+  "version-string": "1.0",
+  "builtin-baseline": "d02f7271407a3c23c9284f2feb8560d9545b51cd",
+  "dependencies": [
+    { "name": "tesseract", "default-features": false }
+  ]
+}
