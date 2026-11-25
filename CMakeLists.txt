@@ -8,6 +8,7 @@ add_executable(SelectAnyText WIN32
     text_layout.cpp
     transfer.cpp
     multilingual_ocr.cpp
+    ocr_color.cpp
     settings.cpp
     settings_theme.cpp
     resources.rc
@@ -32,7 +33,7 @@ add_dependencies(SelectAnyText SelectAnyTextModels)
 option(SELECTANYTEXT_BUILD_TESTS "Build core regression checks" OFF)
 if(SELECTANYTEXT_BUILD_TESTS)
     enable_testing()
-    add_executable(SelectAnyTextTests tests/core_tests.cpp text_layout.cpp settings.cpp capture_region.cpp)
+    add_executable(SelectAnyTextTests tests/core_tests.cpp text_layout.cpp settings.cpp capture_region.cpp ocr_color.cpp)
     target_include_directories(SelectAnyTextTests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
     target_compile_features(SelectAnyTextTests PRIVATE cxx_std_20)
     target_compile_definitions(SelectAnyTextTests PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
@@ -41,7 +42,7 @@ if(SELECTANYTEXT_BUILD_TESTS)
     set_property(TARGET SelectAnyTextTests PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
     add_test(NAME core COMMAND SelectAnyTextTests)
 
-    add_executable(SelectAnyTextOcrTests tests/ocr_tests.cpp transfer.cpp multilingual_ocr.cpp text_layout.cpp)
+    add_executable(SelectAnyTextOcrTests tests/ocr_tests.cpp transfer.cpp multilingual_ocr.cpp ocr_color.cpp text_layout.cpp)
     target_include_directories(SelectAnyTextOcrTests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
     target_compile_features(SelectAnyTextOcrTests PRIVATE cxx_std_20)
     target_compile_definitions(SelectAnyTextOcrTests PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
@@ -55,7 +56,7 @@ if(SELECTANYTEXT_BUILD_TESTS)
     target_compile_features(SelectAnyTextRegionTests PRIVATE cxx_std_20)
     target_compile_definitions(SelectAnyTextRegionTests PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
     target_compile_options(SelectAnyTextRegionTests PRIVATE /W4 /utf-8)
-    target_link_libraries(SelectAnyTextRegionTests PRIVATE user32 gdi32 msimg32)
+    target_link_libraries(SelectAnyTextRegionTests PRIVATE user32 gdi32 msimg32 dwmapi)
     set_property(TARGET SelectAnyTextRegionTests PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
     add_test(NAME region COMMAND SelectAnyTextRegionTests)
     set_tests_properties(region PROPERTIES TIMEOUT 30)

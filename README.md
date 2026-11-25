@@ -2,7 +2,7 @@
 
 **Copy any text you can see on your screen.** From a screenshot, a PDF, a video frame, or an app that won’t let you select it.
 
-[Download for Windows](https://github.com/playaaaaLV/SelectAnyText/releases/tag/v1.0)
+[Download for Windows](https://github.com/playaaaaLV/SelectAnyText/releases/latest)
 
 - **Frame it. Copy it.** Hit **Win+Shift+D**, draw a rectangle, and release to scan. Press **Ctrl+C** to copy and close, or **Esc** to cancel.
 - **See what you’re copying.** All recognized text is highlighted. Draw another rectangle to try a different area.

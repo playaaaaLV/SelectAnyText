@@ -5,6 +5,8 @@
 #include <utility>
 
 namespace {
+constexpr LONG highlightPadding = 2;
+
 LONG CenterY(const RECT& bounds) {
     return bounds.top + bounds.bottom;
 }
@@ -17,9 +19,69 @@ bool SameRow(const RECT& first, const RECT& second) {
         std::abs(CenterY(first) - CenterY(second)) <= std::max(firstHeight, secondHeight);
 }
 
+RECT ReadingBounds(const TextLine& line) {
+    std::vector<LONG> heights;
+    for (const auto& word : line.words) {
+        if (word.stops.size() > 2 && word.bounds.bottom > word.bounds.top) {
+            heights.push_back(word.bounds.bottom - word.bounds.top);
+        }
+    }
+    if (heights.size() < 2) return line.bounds;
+    std::sort(heights.begin(), heights.end());
+    const auto typical = heights[(heights.size() - 1) / 2];
+    RECT result = line.bounds;
+    bool first = true;
+    for (const auto& word : line.words) {
+        const auto height = word.bounds.bottom - word.bounds.top;
+        // One oversized OCR box must not stretch a whole row onto the next row.
+        // Keep normal ascender/descender differences and small punctuation.
+        if (height * 5 > typical * 8) continue;
+        result.top = first ? word.bounds.top : std::min(result.top, word.bounds.top);
+        result.bottom = first ? word.bounds.bottom : std::max(result.bottom, word.bounds.bottom);
+        first = false;
+    }
+    return result;
+}
+
+void SeparateBands(std::vector<RECT>& bands) {
+    for (size_t i = 0; i < bands.size(); ++i) {
+        for (size_t j = i + 1; j < bands.size(); ++j) {
+            auto* upper = &bands[i];
+            auto* lower = &bands[j];
+            if (CenterY(*upper) > CenterY(*lower)) std::swap(upper, lower);
+            if (CenterY(*upper) == CenterY(*lower) || upper->bottom <= lower->top ||
+                upper->right <= lower->left || lower->right <= upper->left) continue;
+            // Share a mistaken overlap rather than painting it twice. Only the
+            // display bands change; word positions and clipboard text stay intact.
+            const auto boundary = std::clamp((upper->bottom + lower->top) / 2,
+                upper->top + 1, std::max(upper->top + 1, lower->bottom - 2));
+            upper->bottom = boundary;
+            lower->top = boundary + 1;
+        }
+    }
+}
+
 }
 
 TextLayout TextLayout::FromFragments(std::vector<TextFragment> fragments) {
+    std::vector<RECT> originalBounds;
+    for (const auto& fragment : fragments) originalBounds.push_back(fragment.line.bounds);
+    for (size_t i = 0; i < fragments.size(); ++i) {
+        const auto original = originalBounds[i];
+        const auto reading = ReadingBounds(fragments[i].line);
+        // Mixed font sizes are legitimate. Correct an outlier only when it
+        // reaches into another row that the normal words do not touch.
+        for (size_t j = 0; j < originalBounds.size(); ++j) {
+            if (i == j) continue;
+            const auto other = originalBounds[j];
+            RECT overlap{};
+            if (IntersectRect(&overlap, &original, &other) &&
+                (reading.bottom <= other.top || reading.top >= other.bottom)) {
+                fragments[i].line.bounds = reading;
+                break;
+            }
+        }
+    }
     std::stable_sort(fragments.begin(), fragments.end(), [](const auto& first, const auto& second) {
         return CenterY(first.line.bounds) < CenterY(second.line.bounds);
     });
@@ -81,10 +143,13 @@ RegionSelection TextLayout::Select(POINT anchor, POINT cursor) const {
         bool firstInLine = true;
         bool adjacent = false;
         size_t previousEnd = 0;
+        const auto height = line.bounds.bottom - line.bounds.top;
+        // OCR can omit the dark outline below colored glyphs. Scale the margin
+        // with the text, then let SeparateBands constrain it between close rows.
+        const auto bottomPadding = std::max(highlightPadding, (height + 9) / 10);
         for (const auto& word : line.words) {
             const auto& stops = word.stops;
             const auto y = CenterY(word.bounds) / 2;
-            const auto height = word.bounds.bottom - word.bounds.top;
             const auto contains = [&](size_t index) {
                 const auto left = std::min(stops[index].x, stops[index + 1].x);
                 const auto right = std::max(stops[index].x, stops[index + 1].x);
@@ -105,8 +170,10 @@ RegionSelection TextLayout::Select(POINT anchor, POINT cursor) const {
                 const auto& end = stops[index];
                 const POINT firstPoint{std::lround(start.x), y};
                 const POINT lastPoint{std::lround(end.x), y};
-                const RECT rect{static_cast<LONG>(std::floor(std::min(start.x, end.x))), word.bounds.top - 1,
-                    static_cast<LONG>(std::ceil(std::max(start.x, end.x))), word.bounds.bottom + 1};
+                const RECT rect{static_cast<LONG>(std::floor(std::min(start.x, end.x))),
+                    line.bounds.top - highlightPadding,
+                    static_cast<LONG>(std::ceil(std::max(start.x, end.x))),
+                    line.bounds.bottom + bottomPadding};
 
                 bool merge = false;
                 if (firstInLine) {
@@ -116,7 +183,8 @@ RegionSelection TextLayout::Select(POINT anchor, POINT cursor) const {
                 } else if (adjacent) {
                     const auto& previous = result.highlights.back();
                     const auto gap = std::max(previous.left, rect.left) - std::min(previous.right, rect.right);
-                    merge = gap <= height;
+                    // Match PDFchic's continuous reading bands, retaining large column gaps.
+                    merge = gap <= 6 * height;
                     result.text.append(text, previousEnd, start.offset - previousEnd);
                 } else {
                     result.text += L' ';
@@ -139,5 +207,10 @@ RegionSelection TextLayout::Select(POINT anchor, POINT cursor) const {
             }
         }
     }
+    for (auto& highlight : result.highlights) {
+        highlight.left -= highlightPadding;
+        highlight.right += highlightPadding;
+    }
+    SeparateBands(result.highlights);
     return result;
 }

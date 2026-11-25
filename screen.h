@@ -35,7 +35,7 @@ private:
     static LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
     LRESULT HandleMessage(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
     bool Capture(POINT cursor);
-    void PrepareSnapshot(uint32_t* pixels);
+    void PrepareSnapshot(const uint32_t* pixels);
     void Paint(HWND window) const;
     void Draw(HDC dc, const RECT& dirty) const;
     void StartScanning();
@@ -59,6 +59,9 @@ private:
     HDC snapshot_ = nullptr;
     HBITMAP bitmap_ = nullptr;
     HGDIOBJ oldBitmap_ = nullptr;
+    HDC canvas_ = nullptr;
+    HBITMAP canvasBitmap_ = nullptr;
+    HGDIOBJ oldCanvasBitmap_ = nullptr;
     Image ocrImage_;
     HDC shade_ = nullptr;
     HBITMAP shadeBitmap_ = nullptr;
@@ -70,6 +73,8 @@ private:
     size_t gesture_ = 0;
     bool dragging_ = false;
     bool copyWhenReady_ = false;
+    ULONGLONG dimStarted_ = 0;
+    BYTE dimProgress_ = 255;
     HFONT scanningFont_ = nullptr;
     RECT scanningBounds_{};
     unsigned scanningDots_ = 0;

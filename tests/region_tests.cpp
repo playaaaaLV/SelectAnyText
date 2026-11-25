@@ -1,6 +1,8 @@
 #include "app_identity.h"
 #include "screen.h"
 
+#include <dwmapi.h>
+#include <cstdlib>
 #include <iostream>
 #include <stdexcept>
 
@@ -46,6 +48,14 @@ void Pump() {
     }
 }
 
+BYTE BrightnessAt(HWND window, int x, int y) {
+    const auto dc = GetDC(window);
+    const auto color = GetPixel(dc, x, y);
+    ReleaseDC(window, dc);
+    Check(color != CLR_INVALID, "Could not sample overlay brightness");
+    return GetRValue(color);
+}
+
 TextFragment Word(std::wstring text, LONG left, LONG top) {
     const RECT rect{left, top, left + static_cast<LONG>(text.size()) * 10, top + 20};
     TextWord word;
@@ -82,16 +92,20 @@ int main() {
         ownerClass.hInstance = instance;
         ownerClass.lpfnWndProc = OwnerProc;
         ownerClass.lpszClassName = L"SelectAnyText.Tests.RegionOwner";
+        ownerClass.hbrBackground = static_cast<HBRUSH>(GetStockObject(WHITE_BRUSH));
         Check(RegisterClassW(&ownerClass) != 0, "Owner registration failed");
-        const auto owner = CreateWindowW(ownerClass.lpszClassName, L"", 0, 0, 0, 0, 0,
+        const auto owner = CreateWindowW(ownerClass.lpszClassName, L"", WS_POPUP, 0, 0, 480, 300,
             nullptr, nullptr, instance, nullptr);
         Check(owner != nullptr, "Owner creation failed");
+        Check(SetWindowPos(owner, HWND_TOPMOST, 0, 0, 480, 300, SWP_NOACTIVATE | SWP_SHOWWINDOW),
+            "Test background could not be shown");
+        UpdateWindow(owner);
+        DwmFlush();
         Check(CaptureOverlay::Register(instance), "Overlay registration failed");
         CaptureOverlay capture;
         overlay = &capture;
         const auto open = [&] {
             Check(capture.Open(instance, owner, copyMessage, {100,100}, scanMessage, cancelMessage), "Open failed");
-            Pump();
             const auto window = FindWindowW(identity::overlayClass, nullptr);
             Check(window != nullptr, "Overlay missing");
             return window;
@@ -99,18 +113,71 @@ int main() {
 
         auto window = open();
         Check(scans == 0, "Opening the overlay must not start full-screen OCR");
+        // Compare against the actual capture; some desktops omit test-owned windows.
+        SendMessageW(window, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(0,0));
+        SendMessageW(window, WM_MOUSEMOVE, MK_LBUTTON, MAKELPARAM(480,300));
+        const auto original = capture.SnapshotForOcr();
+        Check(original.width == 480 && original.height == 300, "Missing reference capture");
+        const auto sourceRed = [&](int x, int y) {
+            return static_cast<int>((original.pixels[static_cast<size_t>(y) * original.width + x] >> 16) & 0xff);
+        };
+        const auto finalOutside = sourceRed(50,150) * 165 / 255;
+        const auto initialBrightness = BrightnessAt(window, 50, 150);
         SendMessageW(window, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(100,100));
         SendMessageW(window, WM_MOUSEMOVE, MK_LBUTTON, MAKELPARAM(360,220));
-        Pump();
         Check(scans == 0, "Dragging must not start OCR before release");
+        auto previousBrightness = initialBrightness;
+        bool intermediateFrame = false;
+        std::vector<unsigned> fadeSamples{initialBrightness};
+        const auto fadeDeadline = GetTickCount64() + 300;
+        do {
+            // Observe each painted timer frame instead of draining the entire fade.
+            MSG message{};
+            if (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+                TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+            const auto brightness = BrightnessAt(window, 50, 150);
+            Check(brightness <= previousBrightness, "Dimming must not flash brighter during the fade");
+            if (brightness != previousBrightness) fadeSamples.push_back(brightness);
+            intermediateFrame |= brightness < initialBrightness - 1 && brightness > finalOutside + 1;
+            previousBrightness = brightness;
+            Sleep(4);
+        } while (GetTickCount64() < fadeDeadline);
+        Pump();
+        const bool startedClear = initialBrightness + 2 >= sourceRed(50,150);
+        if (!(startedClear && intermediateFrame)) {
+            std::cerr << "Fade samples:";
+            for (auto value : fadeSamples) std::cerr << ' ' << value;
+            std::cerr << '\n';
+        }
+        Check(startedClear && intermediateFrame,
+            "Dimming must start clear and display intermediate frames while dragging");
         const auto dc = GetDC(window);
         const auto border = GetPixel(dc, 101, 110);
+        const auto inside = GetPixel(dc, 150, 150);
+        const auto outside = GetPixel(dc, 50, 150);
         ReleaseDC(window, dc);
         Check(border == RGB(35,170,255), "The region frame is not visibly painted");
+        const auto closeEnough = [](int actual, int expected) { return std::abs(actual - expected) <= 2; };
+        Check(closeEnough(GetRValue(inside), sourceRed(150,150) * 200 / 255) &&
+            closeEnough(GetRValue(outside), finalOutside),
+            "The surroundings must be darker without further dimming the crop");
+        SendMessageW(window, WM_MOUSEMOVE, MK_LBUTTON, MAKELPARAM(240,220));
+        Pump();
+        const auto resizedDc = GetDC(window);
+        const auto vacated = GetPixel(resizedDc, 300, 150);
+        ReleaseDC(window, resizedDc);
+        Check(closeEnough(GetRValue(vacated), sourceRed(300,150) * 165 / 255),
+            "Shrinking the frame must restore the darker surroundings");
+        SendMessageW(window, WM_MOUSEMOVE, MK_LBUTTON, MAKELPARAM(360,220));
+        Pump();
         SendMessageW(window, WM_LBUTTONUP, 0, MAKELPARAM(360,220));
         Pump();
         Check(scans == 1 && crop.width == 260 && crop.height == 120 &&
             crop.origin.x == 100 && crop.origin.y == 100, "OCR received the wrong region");
+        Check(!crop.pixels.empty() && crop.pixels.front() == original.pixels[100 * original.width + 100],
+            "Display dimming must not change the source OCR pixels");
         Check(capture.IsCurrent(gesture), "Submitted gesture was invalidated");
         capture.SetText(TextLayout::FromFragments({Word(L"First",110,110), Word(L"line",180,110),
             Word(L"Second",110,160)}));
@@ -155,7 +222,7 @@ int main() {
         Check(!capture.IsOpen() && cancellations > beforeCancel, "Esc must close and cancel OCR");
         DestroyWindow(owner);
         overlay = nullptr;
-        std::cout << "Region checks passed: visible frame, release-to-scan, crop pixels, select-all, repeat/reverse, Ctrl+C, Esc\n";
+        std::cout << "Region checks passed: animated dimming, visible frame, outside dimming, release-to-scan, crop pixels, select-all, repeat/reverse, Ctrl+C, Esc\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;

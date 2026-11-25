@@ -3,7 +3,7 @@ param(
     [Parameter(Mandatory)][string]$VcpkgTripletDir,
     [Parameter(Mandatory)][string]$CrtDir,
     [Parameter(Mandatory)][string]$Iscc,
-    [string]$Version = '1.0',
+    [string]$Version = '1.1',
     [string]$OutputDir = (Join-Path $PSScriptRoot '..\dist')
 )
 

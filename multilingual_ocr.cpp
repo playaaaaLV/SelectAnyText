@@ -1,6 +1,7 @@
 #include "multilingual_ocr.h"
 
 #include "screen.h"
+#include "ocr_color.h"
 
 #include <shlobj.h>
 
@@ -120,7 +121,8 @@ std::vector<std::vector<RecognizedWord>> ParseWords(std::string_view data) {
             row.remove_suffix(1);
         }
         auto text = Utf8Text(row);
-        if (!valid || box[2] <= 0 || box[3] <= 0 || text.empty()) {
+        if (!valid || box[2] <= 0 || box[3] <= 0 ||
+            text.find_first_not_of(L" \t\r\n\u00a0") == std::wstring::npos) {
             continue;
         }
         const std::array line{fields[2], fields[3], fields[4]};
@@ -128,8 +130,10 @@ std::vector<std::vector<RecognizedWord>> ParseWords(std::string_view data) {
             lines.emplace_back();
             previousLine = line;
         }
+        float confidence = 0;
+        std::from_chars(fields[10].data(), fields[10].data() + fields[10].size(), confidence);
         lines.back().push_back({std::move(text),
-            {box[0], box[1], box[0] + box[2], box[1] + box[3]}});
+            {box[0], box[1], box[0] + box[2], box[1] + box[3]}, confidence});
     }
     return lines;
 }
@@ -258,19 +262,36 @@ std::vector<std::vector<RecognizedWord>> MultilingualOcr::Recognize(const Image&
     api.setCancel(monitor.get(), [](void* context, int) {
         return static_cast<std::stop_token*>(context)->stop_requested();
     });
-    api.setImage(api.engine, grayscale.data(), image.width, image.height, 1, image.width);
-    const auto status = api.recognize(api.engine, monitor.get());
-    if (cancel.stop_requested() || status != 0) {
-        api.clear(api.engine);
-        if (cancel.stop_requested()) {
-            return {};
+    const auto scan = [&](const std::vector<unsigned char>& pixels) {
+        api.setImage(api.engine, pixels.data(), image.width, image.height, 1, image.width);
+        const auto status = api.recognize(api.engine, monitor.get());
+        if (cancel.stop_requested() || status != 0) {
+            api.clear(api.engine);
+            if (cancel.stop_requested()) {
+                return std::vector<std::vector<RecognizedWord>>{};
+            }
+            throw std::runtime_error("Tesseract OCR failed");
         }
-        throw std::runtime_error("Tesseract OCR failed");
+        const std::unique_ptr<char, decltype(api.deleteText)> text(api.getTsv(api.engine, 0), api.deleteText);
+        api.clear(api.engine);
+        if (!text) {
+            throw std::runtime_error("Tesseract OCR failed");
+        }
+        return ParseWords(text.get());
+    };
+    auto result = scan(grayscale);
+    if (cancel.stop_requested()) return {};
+    std::vector<std::vector<RecognizedWord>> best;
+    double bestScore = 0;
+    for (const auto& mask : ColorTextMasks(image, cancel)) {
+        if (cancel.stop_requested()) return {};
+        auto candidate = ReliableColorText(scan(mask));
+        const auto score = ColorTextScore(candidate);
+        if (score > bestScore) {
+            bestScore = score;
+            best = std::move(candidate);
+        }
     }
-    const std::unique_ptr<char, decltype(api.deleteText)> text(api.getTsv(api.engine, 0), api.deleteText);
-    api.clear(api.engine);
-    if (!text) {
-        throw std::runtime_error("Tesseract OCR failed");
-    }
-    return ParseWords(text.get());
+    if (cancel.stop_requested()) return {};
+    return MergeColorText(std::move(result), best);
 }

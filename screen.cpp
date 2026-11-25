@@ -10,9 +10,13 @@
 namespace {
 constexpr auto windowClass = identity::overlayClass;
 constexpr BYTE dimOpacity = 55;
-constexpr BYTE selectionOpacity = 150;
+constexpr BYTE outsideDimOpacity = 90;
+constexpr BYTE selectionOpacity = 85;
 constexpr UINT_PTR scanningTimer = 1;
 constexpr UINT scanningFrameMs = 300;
+constexpr UINT_PTR dimTimer = 2;
+constexpr UINT dimFrameMs = 16;
+constexpr ULONGLONG dimDurationMs = 180;
 
 void DeleteSurface(HDC& dc, HBITMAP& bitmap, HGDIOBJ& oldBitmap) {
     if (oldBitmap && oldBitmap != HGDI_ERROR) {
@@ -71,6 +75,12 @@ bool CaptureOverlay::Capture(POINT cursor) {
     if (snapshot_ && bitmap_) {
         oldBitmap_ = SelectObject(snapshot_, bitmap_);
     }
+    // Compose shading offscreen and present each dirty area in a single blit.
+    canvas_ = CreateCompatibleDC(desktop);
+    canvasBitmap_ = CreateCompatibleBitmap(desktop, width, height);
+    if (canvas_ && canvasBitmap_) {
+        oldCanvasBitmap_ = SelectObject(canvas_, canvasBitmap_);
+    }
 
     shade_ = CreateCompatibleDC(desktop);
     shadeBitmap_ = CreateCompatibleBitmap(desktop, 2, 1);
@@ -78,6 +88,7 @@ bool CaptureOverlay::Capture(POINT cursor) {
         oldShadeBitmap_ = SelectObject(shade_, shadeBitmap_);
     }
     const bool captured = snapshot_ && oldBitmap_ && oldBitmap_ != HGDI_ERROR &&
+        oldCanvasBitmap_ && oldCanvasBitmap_ != HGDI_ERROR &&
         oldShadeBitmap_ && oldShadeBitmap_ != HGDI_ERROR &&
         BitBlt(snapshot_, 0, 0, width, height, desktop, bounds_.left, bounds_.top, SRCCOPY | CAPTUREBLT);
     ReleaseDC(nullptr, desktop);
@@ -87,23 +98,17 @@ bool CaptureOverlay::Capture(POINT cursor) {
 
     PrepareSnapshot(static_cast<uint32_t*>(data));
     const auto accent = GetSysColor(COLOR_HIGHLIGHT);
+    SetPixelV(shade_, 0, 0, RGB(0, 0, 0));
     SetPixelV(shade_, 1, 0, accent);
     return true;
 }
 
-void CaptureOverlay::PrepareSnapshot(uint32_t* pixels) {
+void CaptureOverlay::PrepareSnapshot(const uint32_t* pixels) {
     const auto width = bounds_.right - bounds_.left;
     const auto height = bounds_.bottom - bounds_.top;
     const auto count = static_cast<size_t>(width) * height;
     ocrImage_ = Image{width, height, std::vector<uint32_t>(pixels, pixels + count)};
-    // Keep OCR pixels unchanged; every displayed frame starts with the dimmed DIB.
-    constexpr unsigned brightness = 255 - dimOpacity;
-    std::transform(pixels, pixels + count, pixels, [](uint32_t pixel) {
-        const auto blue = (pixel & 0xff) * brightness / 255;
-        const auto green = ((pixel >> 8) & 0xff) * brightness / 255;
-        const auto red = ((pixel >> 16) & 0xff) * brightness / 255;
-        return (pixel & 0xff000000) | (red << 16) | (green << 8) | blue;
-    });
+    // Retain the original DIB as well; dimming is animated only while painting.
 }
 
 bool CaptureOverlay::Open(HINSTANCE instance, HWND owner, UINT copyMessage, POINT cursor,
@@ -118,6 +123,7 @@ bool CaptureOverlay::Open(HINSTANCE instance, HWND owner, UINT copyMessage, POIN
     scanRegionMessage_ = scanRegionMessage;
     cancelRegionMessage_ = cancelRegionMessage;
     previousForeground_ = GetForegroundWindow();
+    dimProgress_ = 0;
     const auto window = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, windowClass, identity::appName,
         WS_POPUP, bounds_.left, bounds_.top, bounds_.right - bounds_.left, bounds_.bottom - bounds_.top,
         owner, nullptr, instance, this);
@@ -131,6 +137,10 @@ bool CaptureOverlay::Open(HINSTANCE instance, HWND owner, UINT copyMessage, POIN
     if (window_ != window) {
         return false;
     }
+    dimStarted_ = GetTickCount64();
+    if (!SetTimer(window, dimTimer, dimFrameMs, nullptr)) {
+        dimProgress_ = 255;
+    }
     RedrawWindow(window, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW);
     return window_ == window;
 }
@@ -141,6 +151,9 @@ void CaptureOverlay::Close(bool restoreFocus) {
     }
     dragging_ = false;
     StopScanning();
+    if (window_) KillTimer(window_, dimTimer);
+    dimProgress_ = 255;
+    dimStarted_ = 0;
     if (const auto window = std::exchange(window_, nullptr)) {
         if (restoreFocus && previousForeground_ && GetForegroundWindow() == window) {
             SetForegroundWindow(previousForeground_);
@@ -152,6 +165,7 @@ void CaptureOverlay::Close(bool restoreFocus) {
     layout_.reset();
     ocrImage_ = {};
     DeleteSurface(shade_, shadeBitmap_, oldShadeBitmap_);
+    DeleteSurface(canvas_, canvasBitmap_, oldCanvasBitmap_);
     DeleteSurface(snapshot_, bitmap_, oldBitmap_);
     if (scanningFont_) {
         DeleteObject(std::exchange(scanningFont_, nullptr));
@@ -279,7 +293,18 @@ LRESULT CaptureOverlay::HandleMessage(HWND window, UINT message, WPARAM wParam, 
         Paint(window);
         return 0;
     case WM_TIMER:
-        if (wParam == scanningTimer && scanningVisible_ && !layout_) {
+        if (wParam == dimTimer && dimProgress_ < 255) {
+            const auto elapsed = GetTickCount64() - dimStarted_;
+            const auto remaining = 1.0 - static_cast<double>(std::min(elapsed, dimDurationMs)) / dimDurationMs;
+            // Ease out using elapsed time, so a busy message queue never prolongs the fade.
+            dimProgress_ = static_cast<BYTE>(255.0 * (1.0 - remaining * remaining) + 0.5);
+            if (dimProgress_ == 255 || elapsed >= dimDurationMs) {
+                dimProgress_ = 255;
+                KillTimer(window, dimTimer);
+            }
+            InvalidateRect(window, nullptr, FALSE);
+            UpdateWindow(window);
+        } else if (wParam == scanningTimer && scanningVisible_ && !layout_) {
             scanningDots_ = scanningVisible_ ? scanningDots_ % 3 + 1 : 1;
             scanningVisible_ = true;
             SetTimer(window, scanningTimer, scanningFrameMs, nullptr);
@@ -358,11 +383,33 @@ void CaptureOverlay::Paint(HWND window) const {
     EndPaint(window, &paint);
 }
 
-void CaptureOverlay::Draw(HDC dc, const RECT& dirty) const {
-    if (snapshot_ && !IsRectEmpty(&dirty)) {
+void CaptureOverlay::Draw(HDC target, const RECT& dirty) const {
+    const auto dc = canvas_;
+    if (snapshot_ && dc && !IsRectEmpty(&dirty)) {
         const auto width = dirty.right - dirty.left;
         const auto height = dirty.bottom - dirty.top;
         BitBlt(dc, dirty.left, dirty.top, width, height, snapshot_, dirty.left, dirty.top, SRCCOPY);
+
+        auto frame = Frame();
+        // Darken only the surroundings; retain the previous brightness in the crop.
+        const auto dim = [&](const RECT& area, BYTE opacity) {
+            RECT clipped{};
+            const auto alpha = static_cast<BYTE>(MulDiv(opacity, dimProgress_, 255));
+            if (alpha && IntersectRect(&clipped, &dirty, &area)) {
+                AlphaBlend(dc, clipped.left, clipped.top, clipped.right - clipped.left,
+                    clipped.bottom - clipped.top, shade_, 0, 0, 1, 1,
+                    BLENDFUNCTION{AC_SRC_OVER, 0, alpha, 0});
+            }
+        };
+        if (IsRectEmpty(&frame)) {
+            dim(dirty, outsideDimOpacity);
+        } else {
+            dim(frame, dimOpacity);
+            dim({dirty.left, dirty.top, dirty.right, frame.top}, outsideDimOpacity);
+            dim({dirty.left, frame.top, frame.left, frame.bottom}, outsideDimOpacity);
+            dim({frame.right, frame.top, dirty.right, frame.bottom}, outsideDimOpacity);
+            dim({dirty.left, frame.bottom, dirty.right, dirty.bottom}, outsideDimOpacity);
+        }
 
         for (const auto& highlight : selection_.highlights) {
             RECT clipped{};
@@ -372,7 +419,6 @@ void CaptureOverlay::Draw(HDC dc, const RECT& dirty) const {
                     BLENDFUNCTION{AC_SRC_OVER, 0, selectionOpacity, 0});
             }
         }
-        auto frame = Frame();
         if (!IsRectEmpty(&frame)) {
             const auto brush = static_cast<HBRUSH>(GetStockObject(DC_BRUSH));
             SetDCBrushColor(dc, RGB(10, 10, 10));
@@ -385,6 +431,7 @@ void CaptureOverlay::Draw(HDC dc, const RECT& dirty) const {
         if (scanningVisible_ && IntersectRect(&clipped, &dirty, &scanningBounds_)) {
             DrawScanning(dc);
         }
+        BitBlt(target, dirty.left, dirty.top, width, height, dc, dirty.left, dirty.top, SRCCOPY);
     }
 }
 

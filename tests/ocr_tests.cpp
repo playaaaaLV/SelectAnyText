@@ -57,6 +57,22 @@ Image Sample(bool dark, bool mixed = false, int repetitions = 1) {
     return Render({L"Copy this text", L"Привет, мир!", L"Labdien, kā klājas?"}, dark, mixed, repetitions);
 }
 
+Image ColoredSample(uint32_t color) {
+    auto image = Sample(false);
+    const auto glyphs = image.pixels;
+    for (int y = 0; y < image.height; ++y) for (int x = 0; x < image.width; ++x) {
+        const auto i = static_cast<size_t>(y) * image.width + x;
+        const unsigned background = 70 + (x / 13 + y / 7) % 160;
+        const unsigned ink = (248 - std::min(248u, glyphs[i] & 255)) * 255 / 224;
+        uint32_t pixel = 0;
+        for (int shift = 0; shift < 24; shift += 8) {
+            pixel |= (((color >> shift & 255) * ink + background * (255 - ink)) / 255) << shift;
+        }
+        image.pixels[i] = pixel;
+    }
+    return image;
+}
+
 Image SmallScreenText(bool dark) {
     return Render({
         L"Остаётся одно существенное ограничение: нынешний EXE не подписан и может вызывать SmartScreen.",
@@ -115,6 +131,9 @@ int main() {
         CheckLanguages(Text(engine.Recognize(Sample(false))));
         CheckLanguages(Text(engine.Recognize(Sample(true))));
         CheckLanguages(Text(engine.Recognize(Sample(true, true, 3))));
+        for (const auto color : {0xffd200u, 0x00dcffu, 0xe628c8u}) {
+            CheckLanguages(Text(engine.Recognize(ColoredSample(color))));
+        }
 
         std::stop_source cancelled;
         cancelled.request_stop();
@@ -166,7 +185,7 @@ int main() {
             // Destruction must cancel active OCR before joining its worker thread.
         }
         DestroyWindow(owner);
-        std::cout << "OCR checks passed: light/dark/mixed text, small 4K screen text, cancellation, recovery, superseded jobs, shutdown\n";
+        std::cout << "OCR checks passed: light/dark/mixed and colored text, small 4K screen text, cancellation, recovery, superseded jobs, shutdown\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;

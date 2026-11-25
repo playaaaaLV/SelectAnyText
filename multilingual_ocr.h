@@ -12,6 +12,7 @@ struct Image;
 struct RecognizedWord {
     std::wstring text;
     RECT bounds;
+    float confidence = 100;
 };
 
 class MultilingualOcr {
