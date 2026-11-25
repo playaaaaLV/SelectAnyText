@@ -8,6 +8,7 @@
 #include <vector>
 
 struct Image;
+enum class OcrPass { Standard, AlignedLine, Display };
 
 struct RecognizedWord {
     std::wstring text;
@@ -21,7 +22,8 @@ public:
     ~MultilingualOcr();
 
     explicit operator bool() const;
-    std::vector<std::vector<RecognizedWord>> Recognize(const Image& image, std::stop_token cancel = {}) const;
+    std::vector<std::vector<RecognizedWord>> Recognize(const Image& image, std::stop_token cancel = {},
+                                                      OcrPass pass = OcrPass::Standard) const;
 
 private:
     struct Impl;

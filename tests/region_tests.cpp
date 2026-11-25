@@ -40,11 +40,18 @@ LRESULT CALLBACK OwnerProc(HWND window, UINT message, WPARAM wParam, LPARAM lPar
     return DefWindowProcW(window, message, wParam, lParam);
 }
 
+void DispatchTestMessage(const MSG& message) {
+    // Drag() sends positions synchronously. Windows also queues a move at
+    // the user's actual cursor when SetCapture runs; that is a different gesture.
+    if (message.message == WM_MOUSEMOVE) return;
+    TranslateMessage(&message);
+    DispatchMessageW(&message);
+}
+
 void Pump() {
     MSG message{};
     while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
-        TranslateMessage(&message);
-        DispatchMessageW(&message);
+        DispatchTestMessage(message);
     }
 }
 
@@ -134,8 +141,7 @@ int main() {
             // Observe each painted timer frame instead of draining the entire fade.
             MSG message{};
             if (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
-                TranslateMessage(&message);
-                DispatchMessageW(&message);
+                DispatchTestMessage(message);
             }
             const auto brightness = BrightnessAt(window, 50, 150);
             Check(brightness <= previousBrightness, "Dimming must not flash brighter during the fade");
@@ -182,6 +188,21 @@ int main() {
         capture.SetText(TextLayout::FromFragments({Word(L"First",110,110), Word(L"line",180,110),
             Word(L"Second",110,160)}));
         Check(capture.SelectedText(window, gesture) == L"First line\r\nSecond", "All crop text must be selected");
+
+        capture.SetText({});
+        const auto sample = [&](int x, int y) {
+            auto surface = GetDC(window);
+            auto color = GetPixel(surface, x, y);
+            ReleaseDC(window, surface);
+            return color;
+        };
+        const auto bandBefore = sample(206,157), cornerBefore = sample(237,132);
+        capture.SetText(TextLayout::FromFragments({Word(L"Diagonal",0,0)}, {180,125,.8,.6}));
+        Pump();
+        // Both samples are inside the axis-aligned bounds, only the first is on the letters.
+        Check(bandBefore != CLR_INVALID && cornerBefore != CLR_INVALID &&
+              sample(206,157) != bandBefore && sample(237,132) == cornerBefore,
+              "The overlay must paint only the inclined polygon");
 
         // A new rectangle replaces the previous result and retains source pixels.
         const auto savedPixels = crop.pixels;

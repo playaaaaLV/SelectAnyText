@@ -1,5 +1,7 @@
 #include "transfer.h"
 #include "multilingual_ocr.h"
+#include "ocr_color.h"
+#include "text_angle.h"
 
 #include <algorithm>
 #include <cstring>
@@ -110,17 +112,117 @@ void AddFragment(std::vector<TextFragment>& fragments, std::wstring text,
     fragments.push_back({std::move(line), std::move(text)});
 }
 
+using OcrRows = std::vector<std::vector<RecognizedWord>>;
+
+double ReadingQuality(const OcrRows& rows) {
+    double score = 0;
+    for (const auto& row : rows) for (const auto& word : row) {
+        if (word.confidence >= 50 && word.bounds.bottom - word.bounds.top <= word.bounds.right - word.bounds.left)
+            score += (word.confidence - 45) * std::min<size_t>(OcrLetterCount(word.text), 16);
+    }
+    return score;
+}
+
+// Large display capitals leave sustained, repeated edges even when page
+// segmentation returns only a small caption elsewhere in the image.
+bool HasMissingTitle(const Image& image, const OcrRows& rows, std::stop_token cancel) {
+    if (image.pixels.size() > 1000000 || image.height < 32 || image.width < 24) return false;
+    std::vector<bool> covered(image.height);
+    for (const auto& row : rows) for (const auto& word : row) {
+        if (word.confidence < 60) continue;
+        for (int y = std::max(0L, word.bounds.top); y < std::min<LONG>(image.height, word.bounds.bottom); ++y)
+            covered[y] = true;
+    }
+    int run = 0;
+    for (int y = 0; y < image.height; ++y) {
+        if (cancel.stop_requested()) return false;
+        int transitions = 0;
+        if (!covered[y]) {
+            const auto* p = image.pixels.data() + size_t(y) * image.width;
+            for (int x = 2; x < image.width; x += 2)
+                transitions += std::abs(text_angle::Luma(p[x]) - text_angle::Luma(p[x - 2])) > 45;
+        }
+        run = transitions >= 4 ? run + 1 : 0;
+        if (run >= 30) return true;
+    }
+    return false;
+}
+
+bool CompleteTitles(const MultilingualOcr& engine, const Image& image, OcrRows& words, std::stop_token cancel) {
+    bool recoveredTitle = false;
+    if (HasMissingTitle(image, words, cancel)) {
+        const auto titles = engine.Recognize(image, cancel, OcrPass::Display);
+        for (const auto& row : titles) for (const auto& word : row) {
+            if (word.confidence < 70) continue;
+            const auto overlaps = [&](const auto& existing) {
+                RECT overlap{};
+                return std::any_of(existing.begin(), existing.end(), [&](const auto& other) {
+                    if (!IntersectRect(&overlap, &word.bounds, &other.bounds)) return false;
+                    const auto area = [](RECT r) { return double(r.right-r.left) * (r.bottom-r.top); };
+                    return area(overlap) >= .4 * std::min(area(word.bounds), area(other.bounds));
+                });
+            };
+            if (std::none_of(words.begin(), words.end(), overlaps)) {
+                words.push_back({word});
+                recoveredTitle |= word.bounds.bottom - word.bounds.top >= 30 && word.confidence >= 85;
+            }
+        }
+    }
+    return recoveredTitle;
+}
+
 TextLayout Recognize(const MultilingualOcr& engine, const Image& image, std::stop_token cancel = {}) {
-    // Preserve the original glyph shapes; resampling reduces screen-text accuracy.
+    if (image.width <= 0 || image.height <= 0 || image.pixels.empty()) return {};
+    auto words = engine.Recognize(image, cancel);
+    ReadingFrame frame{double(image.origin.x), double(image.origin.y)};
+    const double angle = text_angle::Estimate(image, cancel);
+    const bool inclined = std::abs(angle) >= .5 && std::abs(angle) <= 89.5;
+    const bool recoveredTitle = !inclined && CompleteTitles(engine, image, words, cancel);
+    double best = ReadingQuality(words);
+    Image winningRaster;
+    const auto consider = [&](double degrees, OcrPass pass, double minimum) {
+        if (cancel.stop_requested()) return false;
+        auto aligned = text_angle::Align(image, degrees, cancel);
+        if (aligned.image.pixels.empty()) return false;
+        auto candidate = engine.Recognize(aligned.image, cancel, pass);
+        const auto score = ReadingQuality(candidate);
+        if (score < 60 || score < minimum) return false;
+        best = score;
+        words = std::move(candidate);
+        frame = aligned.frame;
+        if (pass == OcrPass::AlignedLine) winningRaster = std::move(aligned.image);
+        return true;
+    };
+    bool aligned = false;
+    if (inclined) {
+        // An already readable, lightly tilted line still needs its true baseline.
+        for (double offset : {0., 180., 90., -90.}) {
+            if (consider(angle + offset, OcrPass::AlignedLine, best * (aligned ? 1.04 : .94)))
+                aligned = true;
+        }
+        if (aligned) CompleteTitles(engine, winningRaster, words, cancel);
+    }
+    const bool tallWord = std::any_of(words.begin(), words.end(), [](const auto &row) {
+        return std::any_of(row.begin(), row.end(), [](const auto &word) {
+            return word.text.size() >= 3 &&
+                   word.bounds.bottom - word.bounds.top > 2 * (word.bounds.right - word.bounds.left);
+        });
+    });
+    if (!aligned && ((image.height > image.width && !recoveredTitle) || tallWord ||
+                     (words.empty() && image.height * 2 >= image.width))) {
+        consider(90, OcrPass::Display, best * 1.12);
+        consider(-90, OcrPass::Display, best * 1.12);
+    }
+    // Inverted type can yield a few confident but incorrect short words.
+    // Compare both directions for short horizontal selections as well as empty ones.
+    if (!inclined && frame.sine == 0 && (best < 65 || (std::abs(angle) < 1 &&
+        words.size() <= 3 && image.pixels.size() <= 1000000)) && !cancel.stop_requested())
+        consider(180, OcrPass::AlignedLine, best * 1.12);
+    if (cancel.stop_requested()) return {};
     const WordMetrics metrics;
     std::vector<TextFragment> fragments;
-    for (auto& line : engine.Recognize(image, cancel)) {
-        for (auto& word : line) {
-            OffsetRect(&word.bounds, image.origin.x, image.origin.y);
-        }
-        AddFragment(fragments, {}, line, metrics);
-    }
-    return TextLayout::FromFragments(std::move(fragments));
+    for (const auto& line : words) AddFragment(fragments, {}, line, metrics);
+    return TextLayout::FromFragments(std::move(fragments), frame);
 }
 }
 

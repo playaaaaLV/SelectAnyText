@@ -411,13 +411,26 @@ void CaptureOverlay::Draw(HDC target, const RECT& dirty) const {
             dim({dirty.left, frame.bottom, dirty.right, dirty.bottom}, outsideDimOpacity);
         }
 
-        for (const auto& highlight : selection_.highlights) {
+        for (size_t i = 0; i < selection_.highlights.size(); ++i) {
             RECT clipped{};
-            if (IntersectRect(&clipped, &dirty, &highlight)) {
-                AlphaBlend(dc, clipped.left, clipped.top, clipped.right - clipped.left,
-                    clipped.bottom - clipped.top, shade_, 1, 0, 1, 1,
-                    BLENDFUNCTION{AC_SRC_OVER, 0, selectionOpacity, 0});
+            if (!IntersectRect(&clipped, &dirty, &selection_.highlights[i])) continue;
+            int saved = 0;
+            if (!selection_.polygons.empty()) {
+                const auto& corners = selection_.polygons[i];
+                auto polygon = CreatePolygonRgn(corners.data(), static_cast<int>(corners.size()), WINDING);
+                if (!polygon) continue;
+                saved = SaveDC(dc);
+                const bool active = saved && ExtSelectClipRgn(dc, polygon, RGN_AND) != ERROR;
+                DeleteObject(polygon);
+                if (!active) {
+                    if (saved) RestoreDC(dc, saved);
+                    continue;
+                }
             }
+            AlphaBlend(dc, clipped.left, clipped.top, clipped.right - clipped.left,
+                clipped.bottom - clipped.top, shade_, 1, 0, 1, 1,
+                BLENDFUNCTION{AC_SRC_OVER, 0, selectionOpacity, 0});
+            if (saved) RestoreDC(dc, saved);
         }
         if (!IsRectEmpty(&frame)) {
             const auto brush = static_cast<HBRUSH>(GetStockObject(DC_BRUSH));

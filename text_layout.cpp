@@ -63,7 +63,7 @@ void SeparateBands(std::vector<RECT>& bands) {
 
 }
 
-TextLayout TextLayout::FromFragments(std::vector<TextFragment> fragments) {
+TextLayout TextLayout::FromFragments(std::vector<TextFragment> fragments, ReadingFrame frame) {
     std::vector<RECT> originalBounds;
     for (const auto& fragment : fragments) originalBounds.push_back(fragment.line.bounds);
     for (size_t i = 0; i < fragments.size(); ++i) {
@@ -87,10 +87,14 @@ TextLayout TextLayout::FromFragments(std::vector<TextFragment> fragments) {
     });
 
     TextLayout layout;
+    layout.frame = frame;
     auto first = fragments.begin();
     while (first != fragments.end()) {
         auto last = first + 1;
         while (last != fragments.end() && SameRow(first->line.bounds, last->line.bounds)) {
+            const auto a = first->line.bounds.bottom - first->line.bounds.top;
+            const auto b = last->line.bounds.bottom - last->line.bounds.top;
+            if (frame.sine != 0 && std::max(a,b) > 2 * std::min(a,b)) break;
             ++last;
         }
         const auto rtlCount = std::count_if(first, last, [](const auto& fragment) {
@@ -127,17 +131,29 @@ TextLayout TextLayout::FromFragments(std::vector<TextFragment> fragments) {
     return layout;
 }
 
+POINT ReadingFrame::OnScreen(double u, double v) const {
+    return {std::lround(x + cosine * u - sine * v), std::lround(y + sine * u + cosine * v)};
+}
+
 RegionSelection TextLayout::Select(POINT anchor, POINT cursor) const {
     RegionSelection result;
     if (anchor.x == cursor.x && anchor.y == cursor.y) {
         return result;
     }
-    const RECT region{std::min(anchor.x, cursor.x), std::min(anchor.y, cursor.y),
-        std::max(anchor.x, cursor.x), std::max(anchor.y, cursor.y)};
+    // Test intervals on both screen axes and both reading axes. This also
+    // excludes letters in the two empty corners of an inclined band's bounds.
+    const double cx = (double(anchor.x) + cursor.x) / 2 - frame.x;
+    const double cy = (double(anchor.y) + cursor.y) / 2 - frame.y;
+    const double hw = std::abs(double(anchor.x) - cursor.x) / 2;
+    const double hh = std::abs(double(anchor.y) - cursor.y) / 2;
+    const double c = frame.cosine, s = frame.sine, ac = std::abs(c), as = std::abs(s);
+    const double u = c * cx + s * cy, v = -s * cx + c * cy;
+    const double rw = ac * hw + as * hh, rh = as * hw + ac * hh;
+    const bool oblique = c != 0 && s != 0;
 
     for (const auto& line : lines) {
-        if (line.bounds.bottom <= region.top || line.bounds.top > region.bottom ||
-            line.bounds.right <= region.left || line.bounds.left >= region.right) {
+        if (line.bounds.bottom <= v - rh || line.bounds.top > v + rh ||
+            line.bounds.right <= u - rw || line.bounds.left >= u + rw) {
             continue;
         }
         bool firstInLine = true;
@@ -153,8 +169,14 @@ RegionSelection TextLayout::Select(POINT anchor, POINT cursor) const {
             const auto contains = [&](size_t index) {
                 const auto left = std::min(stops[index].x, stops[index + 1].x);
                 const auto right = std::max(stops[index].x, stops[index + 1].x);
-                return right > region.left && left < region.right &&
-                    word.bounds.bottom > region.top && word.bounds.top <= region.bottom;
+                if (right <= u - rw || left >= u + rw ||
+                    word.bounds.bottom <= v - rh || word.bounds.top > v + rh) return false;
+                if (!oblique) return true;
+                const double du = (left + right) / 2 - u;
+                const double dv = (word.bounds.top + word.bounds.bottom) * .5 - v;
+                const double gw = (right - left) * .5, gh = (word.bounds.bottom - word.bounds.top) * .5;
+                return std::abs(c * du - s * dv) < hw + ac * gw + as * gh &&
+                       std::abs(s * du + c * dv) < hh + as * gw + ac * gh;
             };
             for (size_t index = 0; index + 1 < stops.size();) {
                 if (!contains(index)) {
@@ -212,5 +234,23 @@ RegionSelection TextLayout::Select(POINT anchor, POINT cursor) const {
         highlight.right += highlightPadding;
     }
     SeparateBands(result.highlights);
+    if (frame.x != 0 || frame.y != 0 || c != 1 || s != 0) {
+        for (auto& box : result.highlights) {
+            const std::array corners{frame.OnScreen(box.left, box.top), frame.OnScreen(box.right, box.top),
+                frame.OnScreen(box.right, box.bottom), frame.OnScreen(box.left, box.bottom)};
+            if (oblique) result.polygons.push_back(corners);
+            box = {corners[0].x, corners[0].y, corners[0].x, corners[0].y};
+            for (const auto p : corners) {
+                box.left = std::min(box.left, p.x);
+                box.top = std::min(box.top, p.y);
+                box.right = std::max(box.right, p.x);
+                box.bottom = std::max(box.bottom, p.y);
+            }
+        }
+        for (auto& span : result.spans) {
+            span.first = frame.OnScreen(span.first.x, span.first.y);
+            span.last = frame.OnScreen(span.last.x, span.last.y);
+        }
+    }
     return result;
 }

@@ -2,6 +2,7 @@
 #include "transfer.h"
 
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
@@ -119,6 +120,44 @@ OcrResult Wait(OcrWorker& worker) {
     }
     throw std::runtime_error("OCR worker timed out");
 }
+
+void CheckOblique(OcrWorker& worker, const Image& label, double degrees) {
+    Image crop{340, 340, {}, {431, 122}};
+    crop.pixels.assign(size_t(crop.width) * crop.height, label.pixels[0]);
+    const double theta = degrees * std::acos(-1.) / 180, c = std::cos(theta), s = std::sin(theta);
+    for (int y = 0; y < crop.height; ++y) for (int x = 0; x < crop.width; ++x) {
+        const double dx = x - 170., dy = y - 170.;
+        const long u = std::lround(c * dx + s * dy + label.width * .5);
+        const long v = std::lround(-s * dx + c * dy + label.height * .5);
+        if (u >= 0 && u < label.width && v >= 0 && v < label.height)
+            crop.pixels[y * crop.width + x] = label.pixels[v * label.width + u];
+    }
+    worker.Submit(9, std::move(crop));
+    auto result = Wait(worker);
+    auto selection = result.layout.Select({431,122}, {771,462});
+    CheckContains(selection.text, L"Vertical label", "Deskewed text changed");
+    if (degrees == 180.) {
+        Check(result.layout.frame.cosine < -.999, "Upside-down label lost its reading direction");
+        return;
+    }
+    Check(selection.polygons.size() == 1, "Expected a single inclined band");
+    const auto& p = selection.polygons.front();
+    const double dx = p[1].x - p[0].x, dy = p[1].y - p[0].y;
+    Check((dx * c + dy * s) / std::hypot(dx, dy) > .999, "Band has the wrong reading angle");
+    // Verify the actual painted geometry covers the source glyphs at the crop offset.
+    int misses = 0, ink = 0;
+    for (int y = 0; y < label.height; ++y) for (int x = 0; x < label.width; ++x) {
+        if ((label.pixels[y * label.width + x] & 255) > 80) continue;
+        const double sx = 601 + c * (x - label.width * .5) - s * (y - label.height * .5);
+        const double sy = 292 + s * (x - label.width * .5) + c * (y - label.height * .5);
+        ++ink;
+        for (size_t i = 0; i < p.size(); ++i) {
+            const auto q = p[(i+1) % 4];
+            if ((q.x-p[i].x)*(sy-p[i].y) < (q.y-p[i].y)*(sx-p[i].x)) { ++misses; break; }
+        }
+    }
+    Check(ink && misses * 100 < ink, "Band misses source glyphs");
+}
 }
 
 int main() {
@@ -165,6 +204,29 @@ int main() {
                 CheckContains(text, L"Store Web Installer: Microsoft", "English product names were changed");
                 CheckContains(text, L"v1.0.", "Small-text version was changed");
                 CheckContains(text, L"Labdien, kā klājas?", "Small Latvian text lost diacritics");
+            }
+            // Exercise the actual clipboard layout at a nonzero crop origin.
+            const auto label = Render({L"Vertical label"}, false, false, 1, 36, 260, 68);
+            for (double degrees : {-147.5, -32., 4.5, 48., 112., 179., 180.}) CheckOblique(worker, label, degrees);
+            for (const int direction : {-1, 1}) {
+                Image strip{label.height, label.width, {}, {83, 121}};
+                strip.pixels.resize(label.pixels.size());
+                for (int y = 0; y < label.height; ++y) for (int x = 0; x < label.width; ++x) {
+                    const int rx = direction > 0 ? label.height - 1 - y : y;
+                    const int ry = direction > 0 ? x : label.width - 1 - x;
+                    strip.pixels[ry * strip.width + rx] = label.pixels[y * label.width + x];
+                }
+                worker.Submit(8, std::move(strip));
+                const auto rotated = Wait(worker);
+                Check(!rotated.error, "Vertical OCR failed");
+                const auto selection = rotated.layout.Select({83,121}, {151,381});
+                Check(selection.text == L"Vertical label" && selection.highlights.size() == 1,
+                    "Rotated selection lost text, ordering or line geometry");
+                const auto box = selection.highlights.front();
+                Check(box.left >= 83 && box.right <= 151 && box.top >= 121 && box.bottom <= 381 &&
+                    box.bottom-box.top > 3*(box.right-box.left), "Vertical highlight is misplaced");
+                Check(rotated.layout.Select({0,0}, {80,380}).text.empty(),
+                    "Selection outside the rotated caption must be empty");
             }
             worker.Submit(2, dense);
             std::this_thread::sleep_for(std::chrono::milliseconds(75));

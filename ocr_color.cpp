@@ -16,7 +16,9 @@ int TextHue(uint32_t pixel) {
     return std::min(255, static_cast<int>(hue * 255 / 6));
 }
 
-size_t Letters(std::wstring_view text) {
+}
+
+size_t OcrLetterCount(std::wstring_view text) {
     size_t count = 0;
     for (const auto character : text) {
         WORD type = 0;
@@ -26,10 +28,11 @@ size_t Letters(std::wstring_view text) {
     return count;
 }
 
+namespace {
 double Confidence(const std::vector<RecognizedWord>& line) {
     double weighted = 0, count = 0;
     for (const auto& word : line) {
-        const auto length = std::max(size_t{1}, Letters(word.text));
+        const auto length = std::max(size_t{1}, OcrLetterCount(word.text));
         weighted += word.confidence * length;
         count += length;
     }
@@ -81,7 +84,7 @@ std::vector<std::vector<unsigned char>> ColorTextMasks(const Image& image, std::
 
 std::vector<std::vector<RecognizedWord>> ReliableColorText(std::vector<std::vector<RecognizedWord>> lines) {
     for (auto& line : lines) {
-        std::erase_if(line, [](const auto& word) { return word.confidence < 50 || Letters(word.text) < 2; });
+        std::erase_if(line, [](const auto& word) { return word.confidence < 50 || OcrLetterCount(word.text) < 2; });
     }
     std::erase_if(lines, [](const auto& line) { return line.empty() || Confidence(line) < 60; });
     return lines;
@@ -91,7 +94,7 @@ double ColorTextScore(const std::vector<std::vector<RecognizedWord>>& lines) {
     size_t letters = 0;
     double score = 0;
     for (const auto& line : lines) for (const auto& word : line) {
-        const auto count = Letters(word.text);
+        const auto count = OcrLetterCount(word.text);
         letters += count;
         score += count * word.confidence;
     }
@@ -108,8 +111,8 @@ std::vector<std::vector<RecognizedWord>> MergeColorText(
             const auto oldBox = Bounds(existing);
             if (!Overlaps(oldBox, box)) return false;
             size_t oldLetters = 0, newLetters = 0;
-            for (const auto& word : existing) oldLetters += Letters(word.text);
-            for (const auto& word : line) newLetters += Letters(word.text);
+            for (const auto& word : existing) oldLetters += OcrLetterCount(word.text);
+            for (const auto& word : line) newLetters += OcrLetterCount(word.text);
             // A confident suffix alone must not block a substantially more complete word/line.
             const bool moreComplete = confidence >= 75 && newLetters * 2 > oldLetters * 3 &&
                 (box.right - box.left) * 3 > (oldBox.right - oldBox.left) * 4;
